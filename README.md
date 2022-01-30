@@ -1,4 +1,6 @@
-### Hi there 👋
+## Hi there 👋 I am Arie!
+
+### I am currently working as geoscientist, with expertise in petrophysics. Been working for more than 9 years in the energy industry, and is looking to learn more about data analytics/science application for energy industry as a whole. I am Indonesian living in Kuala Lumpur, Malaysia (say Hi if you were here!). 
 
 - 🔭 I’m currently working on www.plotpetrophysics.xyz. An online geoscience tool to plot your well log data into a triple combo plot, to formation evaluation plot. 
 - 🌱 I’m currently learning Python for Data Science
