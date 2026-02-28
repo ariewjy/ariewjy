@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sonic Sw Playground (Synthetic Well Log)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #f6f7fb; color: #1f2937; }
+    h1 { margin: 0 0 8px; }
+    .muted { color: #4b5563; margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 8px 12px; margin-bottom: 12px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; }
+    label { display: flex; flex-direction: column; font-size: 12px; gap: 4px; }
+    input { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; }
+    button { background: #2563eb; color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    canvas { width: 100%; height: 900px; border: 1px solid #d1d5db; border-radius: 8px; background: #fff; }
+    pre { white-space: pre-wrap; max-height: 240px; overflow: auto; font-size: 12px; background: #111827; color: #e5e7eb; padding: 10px; border-radius: 8px; }
+    .row { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+    .bad { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <h1>Sonic-based Sw Playground</h1>
+  <div class="muted">Interactive synthetic well-log generator + Gassmann inversion (DTC, DTS, ϕ, Vsh). No external dependencies.</div>
+
+  <div class="card">
+    <div class="grid">
+      <label>Seed<input id="seed" type="number" value="42" /></label>
+      <label>Samples<input id="n" type="number" value="260" /></label>
+      <label>Depth start (m)<input id="d0" type="number" value="2500" /></label>
+      <label>Depth end (m)<input id="d1" type="number" value="2800" /></label>
+
+      <label>Water zone top (m)<input id="wTop" type="number" value="2500" /></label>
+      <label>Water zone base (m)<input id="wBase" type="number" value="2580" /></label>
+      <label>Hydrocarbon top (m)<input id="hTop" type="number" value="2600" /></label>
+      <label>Hydrocarbon base (m)<input id="hBase" type="number" value="2740" /></label>
+
+      <label>Base porosity ϕ<input id="phiBase" type="number" step="0.01" value="0.23" /></label>
+      <label>Porosity amplitude<input id="phiAmp" type="number" step="0.01" value="0.05" /></label>
+      <label>Base Vsh<input id="vshBase" type="number" step="0.01" value="0.22" /></label>
+      <label>Vsh amplitude<input id="vshAmp" type="number" step="0.01" value="0.14" /></label>
+
+      <label>Brine bulk modulus Kw (GPa)<input id="kw" type="number" step="0.1" value="2.6" /></label>
+      <label>Hydrocarbon modulus Khc (GPa)<input id="khc" type="number" step="0.1" value="0.9" /></label>
+      <label>DTC noise (µs/ft)<input id="dtcNoise" type="number" step="0.1" value="0.8" /></label>
+      <label>DTS noise (µs/ft)<input id="dtsNoise" type="number" step="0.1" value="1.0" /></label>
+    </div>
+    <button id="go">Generate synthetic logs + estimate Sw</button>
+    <div id="status" class="muted"></div>
+  </div>
+
+  <div class="row">
+    <div class="card"><canvas id="plot" width="1400" height="900"></canvas></div>
+    <div class="card">
+      <h3 style="margin-top:0">Preview (first 12 rows)</h3>
+      <pre id="table"></pre>
+    </div>
+  </div>
+
+  <script>
+    const FT_TO_M = 0.3048;
+
+    function rng(seed) {
+      let t = seed >>> 0;
+      return function () {
+        t += 0x6D2B79F5;
+        let x = Math.imul(t ^ (t >>> 15), 1 | t);
+        x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
+        return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+    function toVp(dt) { return FT_TO_M * 1e6 / dt; }
+    function toVs(dt) { return FT_TO_M * 1e6 / dt; }
+    function toDtc(vp) { return FT_TO_M * 1e6 / vp; }
+    function toDts(vs) { return FT_TO_M * 1e6 / vs; }
+
+    function gassmannKsat(kdry, km, phi, kf) {
+      const num = (1 - kdry / km) ** 2;
+      const den = (phi / kf) + (1 - phi) / km - kdry / (km * km);
+      return kdry + num / den;
+    }
+
+    function invertKf(ksat, kdry, km, phi) {
+      const a = (1 - kdry / km) ** 2;
+      const b = ksat - kdry;
+      if (Math.abs(b) < 1e-9) return NaN;
+      const den = a / b;
+      const term = den - (1 - phi) / km + kdry / (km * km);
+      if (Math.abs(term) < 1e-12) return NaN;
+      return phi / term;
+    }
+
+    function swFromWood(kf, kw, khc) {
+      const num = (1 / kf) - (1 / khc);
+      const den = (1 / kw) - (1 / khc);
+      return num / den;
+    }
+
+    function calibrateKdry(rows, kw, wTop, wBase) {
+      const w = rows.filter(r => r.depth >= wTop && r.depth <= wBase);
+      if (w.length < 3) return NaN;
+      const ksat = w.reduce((a, r) => a + r.ksat, 0) / w.length;
+      const km = w.reduce((a, r) => a + r.km, 0) / w.length;
+      const phi = w.reduce((a, r) => a + r.phi, 0) / w.length;
+      let best = { err: Infinity, kdry: NaN };
+      for (let i = 100; i < Math.floor(km * 1000); i++) {
+        const kdry = i / 1000;
+        const pred = gassmannKsat(kdry, km, phi, kw);
+        const err = Math.abs(pred - ksat);
+        if (err < best.err) best = { err, kdry };
+      }
+      return best.kdry;
+    }
+
+    function generate() {
+      const get = id => Number(document.getElementById(id).value);
+      const seed = get('seed');
+      const n = get('n');
+      const d0 = get('d0'), d1 = get('d1');
+      const wTop = get('wTop'), wBase = get('wBase');
+      const hTop = get('hTop'), hBase = get('hBase');
+      const phiBase = get('phiBase'), phiAmp = get('phiAmp');
+      const vshBase = get('vshBase'), vshAmp = get('vshAmp');
+      const kw = get('kw'), khc = get('khc');
+      const dtcNoise = get('dtcNoise'), dtsNoise = get('dtsNoise');
+
+      const r = rng(seed);
+      const rows = [];
+
+      const kQuartz = 37.0, kClay = 20.0;
+      const gQuartz = 44.0, gClay = 9.0;
+      const rhoQuartz = 2.65, rhoClay = 2.45, rhoFluid = 1.05;
+
+      for (let i = 0; i < n; i++) {
+        const t = i / (n - 1);
+        const depth = d0 + t * (d1 - d0);
+        const wave1 = Math.sin((depth - d0) * 0.035);
+        const wave2 = Math.cos((depth - d0) * 0.018 + 1.7);
+
+        const phi = clamp(phiBase + phiAmp * wave1 + (r() - 0.5) * 0.02, 0.05, 0.35);
+        const vsh = clamp(vshBase + vshAmp * wave2 + (r() - 0.5) * 0.03, 0.02, 0.6);
+
+        let swTrue = 1.0;
+        if (depth >= hTop && depth <= hBase) {
+          swTrue = clamp(0.35 + 0.15 * Math.sin((depth - hTop) * 0.06) + (r() - 0.5) * 0.08, 0.1, 0.75);
+        }
+
+        const kf = 1 / (swTrue / kw + (1 - swTrue) / khc);
+        const km = (1 - vsh) * kQuartz + vsh * kClay;
+        const gMat = (1 - vsh) * gQuartz + vsh * gClay;
+
+        const frameScale = clamp(0.58 - 0.85 * phi, 0.12, 0.5);
+        const kdry = km * frameScale;
+        const mu = gMat * frameScale;
+
+        const ksat = gassmannKsat(kdry, km, phi, kf);
+        const rho = (1 - phi) * ((1 - vsh) * rhoQuartz + vsh * rhoClay) + phi * rhoFluid;
+
+        const vp = Math.sqrt(((ksat + 4 * mu / 3) * 1e9) / (rho * 1000));
+        const vs = Math.sqrt((mu * 1e9) / (rho * 1000));
+        const dtc = toDtc(vp) + (r() - 0.5) * 2 * dtcNoise;
+        const dts = toDts(vs) + (r() - 0.5) * 2 * dtsNoise;
+
+        const vpObs = toVp(dtc);
+        const vsObs = toVs(dts);
+        const ksatObs = (rho * 1000 * (vpObs ** 2 - 4 * (vsObs ** 2) / 3)) / 1e9;
+
+        rows.push({ depth, phi, vsh, swTrue, rho, km, ksat: ksatObs, dtc, dts });
+      }
+
+      const kdryCal = calibrateKdry(rows, kw, wTop, wBase);
+      let absErr = 0, count = 0;
+
+      for (const row of rows) {
+        const kfInv = invertKf(row.ksat, kdryCal, row.km, row.phi);
+        const sw = swFromWood(kfInv, kw, khc);
+        row.kfInv = kfInv;
+        row.swEst = clamp(sw, 0, 1.2);
+        if (Number.isFinite(row.swEst)) {
+          absErr += Math.abs(row.swEst - row.swTrue);
+          count += 1;
+        }
+      }
+
+      draw(rows);
+      const mae = count ? absErr / count : NaN;
+      document.getElementById('status').innerHTML =
+        `Calibrated Kdry = <b>${kdryCal.toFixed(3)} GPa</b> · Sw MAE vs synthetic truth = <b>${mae.toFixed(3)}</b>` +
+        (Number.isFinite(kdryCal) ? '' : ' <span class="bad">(water zone may be invalid)</span>');
+
+      const header = ['Depth(m)','DTC(us/ft)','DTS(us/ft)','PHI','VSH','Sw_true','Sw_est'];
+      const lines = [header.join('\t')];
+      rows.slice(0, 12).forEach(r => {
+        lines.push([
+          r.depth.toFixed(2), r.dtc.toFixed(2), r.dts.toFixed(2), r.phi.toFixed(3), r.vsh.toFixed(3), r.swTrue.toFixed(3), r.swEst.toFixed(3)
+        ].join('\t'));
+      });
+      document.getElementById('table').textContent = lines.join('\n');
+    }
+
+    function draw(rows) {
+      const canvas = document.getElementById('plot');
+      const ctx = canvas.getContext('2d');
+      const W = canvas.width, H = canvas.height;
+      ctx.clearRect(0, 0, W, H);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, W, H);
+
+      const tracks = [
+        { key: 'dtc', min: 50, max: 160, color: '#2563eb', label: 'DTC (us/ft)' },
+        { key: 'dts', min: 90, max: 280, color: '#9333ea', label: 'DTS (us/ft)' },
+        { key: 'phi', min: 0, max: 0.4, color: '#0f766e', label: 'PHI' },
+        { key: 'vsh', min: 0, max: 0.8, color: '#b45309', label: 'VSH' },
+        { key: 'swTrue', min: 0, max: 1.2, color: '#111827', label: 'Sw true' },
+        { key: 'swEst', min: 0, max: 1.2, color: '#dc2626', label: 'Sw est' },
+      ];
+
+      const depthMin = rows[0].depth;
+      const depthMax = rows[rows.length - 1].depth;
+      const margin = { left: 40, right: 10, top: 30, bottom: 20 };
+      const plotH = H - margin.top - margin.bottom;
+      const trackW = (W - margin.left - margin.right) / tracks.length;
+
+      function y(depth) { return margin.top + ((depth - depthMin) / (depthMax - depthMin)) * plotH; }
+
+      ctx.strokeStyle = '#e5e7eb';
+      for (let d = depthMin; d <= depthMax + 0.001; d += 25) {
+        const yy = y(d);
+        ctx.beginPath(); ctx.moveTo(margin.left, yy); ctx.lineTo(W - margin.right, yy); ctx.stroke();
+        ctx.fillStyle = '#6b7280'; ctx.font = '11px Arial'; ctx.fillText(d.toFixed(0), 6, yy + 3);
+      }
+
+      tracks.forEach((t, i) => {
+        const x0 = margin.left + i * trackW + 8;
+        const x1 = margin.left + (i + 1) * trackW - 8;
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.strokeRect(x0, margin.top, x1 - x0, plotH);
+        ctx.fillStyle = '#111827';
+        ctx.font = '12px Arial';
+        ctx.fillText(t.label, x0 + 4, 16);
+
+        ctx.beginPath();
+        rows.forEach((r, idx) => {
+          const xv = x0 + ((r[t.key] - t.min) / (t.max - t.min)) * (x1 - x0);
+          const yv = y(r.depth);
+          if (idx === 0) ctx.moveTo(xv, yv); else ctx.lineTo(xv, yv);
+        });
+        ctx.strokeStyle = t.color;
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+
+        ctx.fillStyle = '#6b7280';
+        ctx.font = '10px Arial';
+        ctx.fillText(t.min.toFixed(2), x0, H - 6);
+        ctx.fillText(t.max.toFixed(2), x1 - 35, H - 6);
+      });
+    }
+
+    document.getElementById('go').addEventListener('click', generate);
+    generate();
+  </script>
+</body>
+</html>
